@@ -139,7 +139,7 @@ def evidential_loss(alpha, beta, y, lam=0.2,eps=1e-8):
     # y: (B,) in {0,1}
     # S = alpha + beta
     # p = alpha / (S + 1e-8)
-
+    y = y.view(-1)
     if y.dtype != torch.long:
         y = y.long()
     
@@ -169,7 +169,7 @@ def train_loop():
     max_iter = 64000
     lr = 0.001
     max_epoch = 300
-    data=PT_data_loader(data_path, split='train')
+    data=PT_data_loader(data_path, split='train', use_color=False)
     data_size=len(data)
     train_size=int(data_size*0.8)
     valid_size=data_size-train_size
@@ -260,7 +260,8 @@ def train_loop():
 
         for i, (batch) in enumerate(train_data_loader):
             iter_range = e*len(train_data_loader) + i
-            label = batch.pop("label").to(device).float()      # (B,) float
+            #label = batch.pop("label").to(device).float()      # (B,) float
+            label = batch.pop("label").to(device).long()      # (B,) long
             inputs = batch                                     # {'coord','feat','offset', ...}
 
             # 입력 텐서 전부 같은 디바이스로    
@@ -269,37 +270,19 @@ def train_loop():
         
             alpha, beta, p = PT_model(inputs)
             
-            target = label.float().unsqueeze(1)
+#            target = label.float().unsqueeze(1)
+            target = label.view(-1) 
             evi_loss = evidential_loss(alpha=alpha, beta=beta, y=target, lam=0.1)
 
-            #loss = loss_model(out, target)
-            #probs = torch.sigmoid(p)
-            #probs = accuracy_from_prob(p, target)
-
-            # assert out.ndim == 2 and out.shape[1] == 1, f"bad logits shape: {out.shape}"
-            # assert out.device.type == 'cuda'
 
             # 2) 그래디언트 실제로 생기는지
             #optimizer.zero_grad()
             evi_loss.backward()
-            # grad_any = False
-            # for n,p in PT_model.named_parameters():
-            #     if p.grad is not None and torch.isfinite(p.grad).all() and p.grad.abs().max() > 0:
-            #         grad_any = True
-            #         break
-            # assert grad_any, "⚠️ grad가 안 생깁니다. (모델 출력/손실/파이프라인 점검 필요)"
 
-            # # 3) 파라미터가 업데이트 되는지
-            # with torch.no_grad():
-            #     w = next(PT_model.parameters())
-            #     w_norm_before = w.norm().item()
-            # optimizer.step()
-            # w_norm_after = w.norm().item()
-            # assert w_norm_before != w_norm_after, "⚠️ optimizer.step() 이후 가중치가 안 바뀝니다."
-
-
-            pred_label = (p > 0.5).long()  
-            n_correct = (pred_label == label.float()).sum()
+            pred_label = (p > 0.5).long()
+            n_correct = (pred_label == label).sum()
+            # pred_label = (p > 0.5).long()  
+            # n_correct = (pred_label == label.float()).sum()
 
             batch_acc = (n_correct.float() / len(target)).item()
             epoch_train_losses.append(evi_loss.item())

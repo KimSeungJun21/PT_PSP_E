@@ -63,15 +63,66 @@ log = get_root_logger(file_mode="a")  # "w"면 매번 새로
 #             ),
 #         ]
 
-transform = [
-    dict(type="CenterShift", apply_z=True),
-    dict(type="GridSample", grid_size=0.02, hash_type="fnv",
-         mode="train", return_grid_coord=True, keys=('coord','segment','seg_feat')),
-    dict(type="CenterShift", apply_z=True),
-    #dict(type="NormalizeColor"),
-    dict(type="ToTensor"),
-    dict(type="Collect", keys=("coord","grid_coord","segment"), feat_keys=("coord",'seg_feat')),
-]
+
+def safe_torch_load(fn, map_location="cpu"):
+    """
+    Load a torch serialized file with a clearer error message for corrupted files.
+
+    The original crash was ``ValueError: buffer size does not match array size``
+    coming from ``torch.load`` when a ``.pth`` file was partially written.  The
+    wrapped loader attempts a CPU load first and, on failure, re-raises with the
+    file path and size so the caller knows which sample needs to be regenerated.
+    """
+
+    try:
+        return torch.load(fn, map_location=map_location)
+    except ValueError as exc:
+        try:
+            file_size = os.stat(fn).st_size
+        except OSError:
+            file_size = None
+
+        size_info = f" ({file_size} bytes)" if file_size is not None else ""
+        raise ValueError(
+            f"Failed to load corrupted sample '{fn}'{size_info}: {exc}. "
+            "Please regenerate or re-download the dataset file."
+        ) from exc
+
+
+
+def build_transform(include_color: bool = False):
+    """필요에 따라 컬러 정규화를 포함할지 결정하는 transform 구성."""
+
+    t = [
+        dict(type="CenterShift", apply_z=True),
+        dict(
+            type="GridSample",
+            grid_size=0.02,
+            hash_type="fnv",
+            mode="train",
+            return_grid_coord=True,
+            keys=("coord", "segment", "seg_feat"),
+        ),
+        dict(type="CenterShift", apply_z=True),
+    ]
+
+    if include_color:
+        t.append(dict(type="NormalizeColor"))
+
+    t.extend(
+        [
+            dict(type="ToTensor"),
+            dict(
+                type="Collect",
+                keys=("coord", "grid_coord", "segment"),
+                feat_keys=("coord", "seg_feat") + (() if not include_color else ("color",)),
+            ),
+        ]
+    )
+
+    return t
+
+
 
 import torch, numpy as np
 from collections.abc import Mapping
@@ -178,11 +229,17 @@ def unified_collate_fn(batch, mix_prob=0.0):
     return out
 
 class PT_data_loader(Dataset):
-    def __init__(self, root, split='train', process_data=False):
+
+    NORMALIZATION_DEBUG_SAMPLES = 5
+
+    def __init__(self, root, split='train', process_data=False, use_color: bool = False):
         self.root = root
         self.data_path = []
         self.label = None
-        self.transform = Compose(transform)
+        self.use_color = use_color
+        self.transform = Compose(build_transform(include_color=self.use_color))
+        self._normalization_logged = 0
+
         if split == 'train':
             data_file_path = os.path.join(self.root, 'train')
             data_file_list = os.listdir(data_file_path)
@@ -205,28 +262,80 @@ class PT_data_loader(Dataset):
         return self._get_item(index)
 
     def _get_item(self, index):
-        fn = self.data_path[index]
-        datas = torch.load(fn, map_location="cuda:0")
-        
+        # fn = self.data_path[index]
+        # #datas = torch.load(fn, map_location="cuda:0")
+        # datas = safe_torch_load(fn, map_location="cpu")
+
+        max_retry = 5
+        for attempt in range(max_retry):
+            fn = self.data_path[index]
+            try:
+                datas = safe_torch_load(fn, map_location="cpu")
+                break
+            except ValueError as exc:
+                log.warning(
+                    "Skipping corrupted sample %s (attempt %d/%d): %s",
+                    fn,
+                    attempt + 1,
+                    max_retry,
+                    exc,
+                )
+                index = random.randrange(len(self.data_path))
+        else:
+            raise RuntimeError(
+                f"Exceeded {max_retry} attempts to load a valid sample (last: '{fn}')"
+            )
+
+
         if "semantic_gt" in datas.keys():
             segment = datas["semantic_gt"].reshape([-1])
             seg_feat = segment.astype(np.float32).reshape(-1, 1)
 
         if "instance_gt" in datas.keys():
             instance = datas["instance_gt"].reshape([-1])
-        
+
+
+        if not self.use_color and "color" in datas:
+            datas.pop("color", None)
+
+
         data_dict = dict(
             coord=datas['coord'],
-            color=datas['color'],
             segment=segment,
-            seg_feat = seg_feat,
+            seg_feat=seg_feat,
             instance=instance,
         )
+
+        if self.use_color and "color" in datas:
+            data_dict["color"] = datas["color"]
 
         #log.info(f"datas {fn}")
 
 
         data_dict = self.transform(data_dict)
+        if self._normalization_logged < self.NORMALIZATION_DEBUG_SAMPLES:
+            coord = data_dict.get("coord")
+            color = data_dict.get("color") if self.use_color else None
+            # coord normalization check (CenterShift twice -> mean near 0)
+            if coord is not None and hasattr(coord, "mean"):
+                coord_mean = coord.mean(dim=0)
+                coord_std = coord.std(dim=0)
+                log.info(
+                    "[norm-check] coord mean=%s std=%s for %s",
+                    coord_mean.tolist(),
+                    coord_std.tolist(),
+                    fn,
+                )
+            if color is not None and hasattr(color, "amin"):
+                log.info(
+                    "[norm-check] color min=%.3f max=%.3f (expected 0-1) for %s",
+                    float(color.amin()),
+                    float(color.amax()),
+                    fn,
+                )
+            self._normalization_logged += 1
+
+
         data_dict['data_fn'] = fn
         fn_fixed = fn.replace("/PT_data/train/", "/PT_data/")
         
