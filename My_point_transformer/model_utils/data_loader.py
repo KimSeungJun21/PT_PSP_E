@@ -144,6 +144,31 @@ def to_long_1d(x):
         t = torch.as_tensor(x).view(-1).to(torch.long)
     return t.contiguous()
 
+def safe_torch_load(fn, map_location="cpu"):
+    """
+    Load a torch serialized file with a clearer error message for corrupted files.
+
+    The original crash was ``ValueError: buffer size does not match array size``
+    coming from ``torch.load`` when a ``.pth`` file was partially written.  The
+    wrapped loader attempts a CPU load first and, on failure, re-raises with the
+    file path and size so the caller knows which sample needs to be regenerated.
+    """
+
+    try:
+        return torch.load(fn, map_location=map_location)
+    except ValueError as exc:
+        try:
+            file_size = os.stat(fn).st_size
+        except OSError:
+            file_size = None
+
+        size_info = f" ({file_size} bytes)" if file_size is not None else ""
+        raise ValueError(
+            f"Failed to load corrupted sample '{fn}'{size_info}: {exc}. "
+            "Please regenerate or re-download the dataset file."
+        ) from exc
+
+
 def unified_collate_fn(batch, mix_prob=0.0):
     """
     지원:
@@ -253,6 +278,20 @@ class PT_data_loader(Dataset):
                         labels = json.load(f)
                     self.label = labels
 
+        if split == 'test':
+            data_file_path = os.path.join(self.root, 'test')
+            data_file_list = os.listdir(data_file_path)
+            for data_file in data_file_list:
+                if data_file.endswith('.pth'):
+                    path = os.path.join(data_file_path, data_file)
+                    self.data_path.append(path)
+                elif data_file.endswith('.json'):
+                    path = os.path.join(data_file_path, data_file)
+                    with open(path,'r') as f:
+                        labels = json.load(f)
+                    self.label = labels
+
+
 
 
     def __len__(self):
@@ -289,7 +328,9 @@ class PT_data_loader(Dataset):
 
         if "semantic_gt" in datas.keys():
             segment = datas["semantic_gt"].reshape([-1])
-            seg_feat = segment.astype(np.float32).reshape(-1, 1)
+            target_id = max(segment)
+            seg_feat = (segment == target_id).astype(np.float32).reshape(-1, 1)
+            #seg_feat = segment.astype(np.float32).reshape(-1, 1)
 
         if "instance_gt" in datas.keys():
             instance = datas["instance_gt"].reshape([-1])
@@ -320,19 +361,20 @@ class PT_data_loader(Dataset):
             if coord is not None and hasattr(coord, "mean"):
                 coord_mean = coord.mean(dim=0)
                 coord_std = coord.std(dim=0)
-                log.info(
-                    "[norm-check] coord mean=%s std=%s for %s",
-                    coord_mean.tolist(),
-                    coord_std.tolist(),
-                    fn,
-                )
+                # log.info(
+                #     "[norm-check] coord mean=%s std=%s for %s",
+                #     coord_mean.tolist(),
+                #     coord_std.tolist(),
+                #     fn,
+                # )
             if color is not None and hasattr(color, "amin"):
-                log.info(
-                    "[norm-check] color min=%.3f max=%.3f (expected 0-1) for %s",
-                    float(color.amin()),
-                    float(color.amax()),
-                    fn,
-                )
+                # log.info(
+                #     "[norm-check] color min=%.3f max=%.3f (expected 0-1) for %s",
+                #     float(color.amin()),
+                #     float(color.amax()),
+                #     fn,
+                # )
+                pass
             self._normalization_logged += 1
 
 

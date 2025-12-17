@@ -552,7 +552,8 @@ class PointTransformerV3(PointModule):
         pdnorm_decouple=True,
         pdnorm_adaptive=False,
         pdnorm_affine=True,
-        pdnorm_conditions=("ScanNet", "S3DIS", "Structured3D"),
+        #pdnorm_conditions=("ScanNet", "S3DIS", "Structured3D"),
+        pdnorm_conditions=None,
         
     ):
         super().__init__()
@@ -560,6 +561,14 @@ class PointTransformerV3(PointModule):
         self.order = [order] if isinstance(order, str) else order
         self.cls_mode = cls_mode
         self.shuffle_orders = shuffle_orders
+
+
+        if pdnorm_bn or pdnorm_ln:
+            if not pdnorm_conditions:
+                pdnorm_conditions = ("Custom",)
+            elif isinstance(pdnorm_conditions, str):
+                pdnorm_conditions = (pdnorm_conditions,)
+
 
         assert self.num_stages == len(stride) + 1
         assert self.num_stages == len(enc_depths)

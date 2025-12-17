@@ -150,8 +150,8 @@ def evidential_loss(alpha, beta, y, lam=0.2,eps=1e-8):
     #alpha_beta = torch.stack([alpha, beta], dim=1)
     S = alpha_beta.sum(dim=1) # (B,)
 
-    alpha_y = alpha_beta[torch.arange(y.size(0), device=y.device), y]
-    
+    #alpha_y = alpha_beta[torch.arange(y.size(0), device=y.device), y]
+    alpha_y = torch.where(y == 1, alpha, beta)
     #alpha = alpha.clamp_min(eps)  # Dirichlet는 >0 필요
 
     uce = torch.digamma(S) - torch.digamma(alpha_y)
@@ -194,19 +194,6 @@ def train_loop():
             drop_last=True,
             persistent_workers=True,
         )
-
-
-    tiny = torch.utils.data.Subset(train_data, list(range(80)))
-    tiny_loader = torch.utils.data.DataLoader(
-                tiny,
-                batch_size=batch_size,
-                shuffle=True,
-                num_workers=4,
-                collate_fn=partial(unified_collate_fn, mix_prob=0.0),
-                pin_memory=True,
-                drop_last=True,
-                persistent_workers=True,
-            )
 
     PT_model = PointTransformerV3()
     PT_model.to(device)
@@ -302,6 +289,14 @@ def train_loop():
                 print(f'Train Epoch: {e} / iter.{iter_range}')
                 print('epoch loss',evi_loss.item())
                 print('epoch accuracy',accuracy.item())
+                correct_mask = (pred_label == label)
+                wrong_mask   = ~correct_mask
+
+                S = alpha + beta
+
+                print("correct S mean:", S[correct_mask].mean().item())
+                print("wrong   S mean:", S[wrong_mask].mean().item())
+                            
             count+=1
             global_step = 0
         wandb.log({
@@ -311,59 +306,59 @@ def train_loop():
             }, step=e)
 
 
-        # val_correct = 0
-        # val_data_len = 0
-        # epoch_val_losses = []
-        # epoch_val_accs   = []
-        # with torch.no_grad():
-        #     PT_model.eval()
-        #     val_total = 0
-        #     val_correct = 0
-        #     val_loss_sum = 0.0
-        #     val_label_pos = 0
-        #     val_pred_pos  = 0
-        #     for i, (batch) in enumerate(test_data_loader):
-        #         label = batch.pop("label").to(device).float()      # (B,) float
-        #         inputs = batch                                     # {'coord','feat','offset', ...}
+        val_correct = 0
+        val_data_len = 0
+        epoch_val_losses = []
+        epoch_val_accs   = []
+        with torch.no_grad():
+            PT_model.eval()
+            val_total = 0
+            val_correct = 0
+            val_loss_sum = 0.0
+            val_label_pos = 0
+            val_pred_pos  = 0
+            for i, (batch) in enumerate(test_data_loader):
+                label = batch.pop("label").to(device).float()      # (B,) float
+                inputs = batch                                     # {'coord','feat','offset', ...}
 
-        #         # 입력 텐서 전부 같은 디바이스로    
-        #         move_to_device(inputs, device)                  # {'coord','feat','offset',...}
-        #         optimizer.zero_grad(set_to_none=True)
+                # 입력 텐서 전부 같은 디바이스로    
+                move_to_device(inputs, device)                  # {'coord','feat','offset',...}
+                optimizer.zero_grad(set_to_none=True)
 
-        #         alpha, beta, p = PT_model(inputs)
-        #         target = label.float().unsqueeze(1)
-        #         evi_loss = evidential_loss(alpha=alpha, beta=beta, y=target, lam=0.1)
-        #         #loss = loss_model(out, target)
+                alpha, beta, p = PT_model(inputs)
+                target = label.float().unsqueeze(1)
+                evi_loss = evidential_loss(alpha=alpha, beta=beta, y=target, lam=0.1)
+                #loss = loss_model(out, target)
                 
-        #         #pred_label = (probs > 0.5).long()
-        #         pred_label = (p > 0.5).long()
-        #         corr  = (pred_label == label.float()).sum().item()
-        #         B = target.numel()     
-        #         val_pred_pos  += pred_label.sum().item()
-        #         val_label_pos += label.long().sum().item()
-        #         val_correct += corr
-        #         val_total   += B
-        #         val_loss_sum += evi_loss.item() * B
+                #pred_label = (probs > 0.5).long()
+                pred_label = (p > 0.5).long()
+                corr  = (pred_label == label.float()).sum().item()
+                B = target.numel()     
+                val_pred_pos  += pred_label.sum().item()
+                val_label_pos += label.long().sum().item()
+                val_correct += corr
+                val_total   += B
+                val_loss_sum += evi_loss.item() * B
             
-        #     val_loss_epoch = val_loss_sum / val_total
-        #     val_acc_epoch  = val_correct / val_total
+            val_loss_epoch = val_loss_sum / val_total
+            val_acc_epoch  = val_correct / val_total
 
-        #     wandb.log({
-        #         "val/loss": val_loss_epoch,
-        #         "val/acc":  val_acc_epoch,
-        #         "val/pred_pos": val_pred_pos,
-        #         "val/label_pos": val_label_pos,
-        #         "epoch": e,
-        #     }, step=e)
+            wandb.log({
+                "val/loss": val_loss_epoch,
+                "val/acc":  val_acc_epoch,
+                "val/pred_pos": val_pred_pos,
+                "val/label_pos": val_label_pos,
+                "epoch": e,
+            }, step=e)
 
-        #     times = time_stamp()
-        #     result_s = "***"*20 + " " + times + "\n"
-        #     print(result_s)
-        #     print(f'Validation Epoch: {e} / iter.{iter_range}')
-        #     print('val loss', val_loss_epoch)
-        #     print('val accuracy', val_acc_epoch)
-        #     print(f"[VAL] #pred=1: {val_pred_pos} | #pred=0: {val_total - val_pred_pos}")
-        #     print(f"[VAL] #label=1: {val_label_pos} | #label=0: {val_total - val_label_pos}")
+            times = time_stamp()
+            result_s = "***"*20 + " " + times + "\n"
+            print(result_s)
+            print(f'Validation Epoch: {e} / iter.{iter_range}')
+            print('val loss', val_loss_epoch)
+            print('val accuracy', val_acc_epoch)
+            print(f"[VAL] #pred=1: {val_pred_pos} | #pred=0: {val_total - val_pred_pos}")
+            print(f"[VAL] #label=1: {val_label_pos} | #label=0: {val_total - val_label_pos}")
         #torch.save(PT_model.state_dict(), "save_point_net_"+str(e)+".pth")
         scheduler.step()
 
