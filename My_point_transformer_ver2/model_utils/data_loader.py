@@ -101,7 +101,7 @@ def build_transform(include_color: bool = False):
     # seg_feat를 feat로만 쓰고 dict에서는 버려도 되면 아래 줄은 빼도 됨
     collect_keys.append("seg_feat")  # ⭐ 디버깅/분석용으로 남기고 싶으면 유지
 
-    feat_keys = ["coord", "seg_feat"]
+    feat_keys = ["normal"]
     if include_color:
         feat_keys.append("color")
 

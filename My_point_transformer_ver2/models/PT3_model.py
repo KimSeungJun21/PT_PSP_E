@@ -31,101 +31,6 @@ import logging, os
 log = get_root_logger(log_file="tools/train.log", log_level=logging.DEBUG, file_mode="a")  # "w"면 매번 새로
 
 
-import open3d as o3d
-import numpy as np
-
-
-def extract_patch_attention_by_tag(point, tag="enc4_block1", patch_idx=0, query_idx=0):
-    attn  = point[f"attn_m_{tag}"]       # 이미 cpu
-    order = point[f"attn_order_{tag}"]   # 이미 cpu
-
-    K = attn.shape[-1]
-    order2d = order.view(-1, K)
-    key_ids = order2d[patch_idx]         # cpu tensor (Long)
-
-    # point.coord는 보통 GPU -> key_ids를 같은 device로
-    coords = point.coord[key_ids.to(point.coord.device)]  # (K,3) on same device
-
-    w = attn[patch_idx, query_idx, :]    # cpu
-    q_coord = coords[query_idx]
-
-    return (
-        coords.detach().cpu().numpy(),
-        w.detach().cpu().numpy(),
-        q_coord.detach().cpu().numpy(),
-        key_ids.detach().cpu().numpy(),
-    )
-
-def show_patch_attention_o3d(coords, w, q_coord=None, point_size=3.0):
-    """
-    coords: (K,3)
-    w: (K,) attention weights
-    q_coord: (3,) query 점 좌표 (강조 표시용, 옵션)
-    """
-    # 0~1 정규화
-    w = w - w.min()
-    if w.max() > 1e-12:
-        w = w / w.max()
-
-    # 색상: weight를 빨강 채널로 (단순)
-    colors = np.zeros((coords.shape[0], 3), dtype=np.float32)
-    colors[:, 0] = w  # red intensity
-
-    pcd = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector(coords.astype(np.float64))
-    pcd.colors = o3d.utility.Vector3dVector(colors.astype(np.float64))
-
-    geoms = [pcd]
-
-    # query point를 구로 강조
-    if q_coord is not None:
-        sph = o3d.geometry.TriangleMesh.create_sphere(radius=0.01)
-        sph.translate(q_coord.astype(np.float64))
-        sph.paint_uniform_color([0, 1, 0])  # green
-        geoms.append(sph)
-
-    vis = o3d.visualization.Visualizer()
-    vis.create_window()
-    for g in geoms:
-        vis.add_geometry(g)
-    opt = vis.get_render_option()
-    opt.point_size = float(point_size)
-    vis.run()
-    vis.destroy_window()
-
-
-def extract_patch_attention(point, order_index=0, patch_idx=0, query_idx=0, head_avg=True):
-    """
-    point: Pointcept Point (forward 결과)
-    order_index: 저장한 attn_m_{order_index}를 사용할 인덱스
-    patch_idx: 몇 번째 patch를 볼지
-    query_idx: patch 내부에서 몇 번째 query point를 기준으로 볼지 (0~K-1)
-
-    return:
-      coords_np: (K,3) patch의 key point 좌표
-      w_np:      (K,)  query_idx가 각 key를 보는 attention weight
-      q_coord:   (3,)  query point 좌표
-      key_ids:   (K,)  원본 point에서의 point index들
-    """
-    attn = point[f"attn_m_{order_index}"]          # (Npatch, K, K)  (head 평균 저장했다고 가정)
-    order = point[f"attn_order_{order_index}"]     # (Npad,)
-    # pad/inverse도 저장했지만, "patch 내부 attention 시각화"엔 order만으로 충분함
-
-    # K는 attn의 마지막 차원
-    K = attn.shape[-1]
-
-    # order를 (Npatch, K)로 reshape해서 patch별 point index를 얻음
-    order2d = order.view(-1, K)                    # (Npatch, K)
-    key_ids = order2d[patch_idx]                   # (K,)
-
-    # patch의 point 좌표 (point.coord는 (N,3))
-    coords = point.coord[key_ids]                  # (K,3)
-
-    # query_idx의 attention 분포: (K,)
-    w = attn[patch_idx, query_idx, :]              # (K,)
-
-    return coords.cpu().numpy(), w.cpu().numpy(), coords[query_idx].cpu().numpy(), key_ids.cpu().numpy()
-
 
 class RPE(torch.nn.Module):
     def __init__(self, patch_size, num_heads):
@@ -164,7 +69,6 @@ class SerializedAttention(PointModule):
         enable_flash=True,
         upcast_attention=True,
         upcast_softmax=True,
-        attn_tag=None
     ):
         super().__init__()
         assert channels % num_heads == 0
@@ -176,7 +80,6 @@ class SerializedAttention(PointModule):
         self.upcast_softmax = upcast_softmax
         self.enable_rpe = enable_rpe
         self.enable_flash = enable_flash
-        self.attn_tag = attn_tag
         if enable_flash:
             assert (
                 enable_rpe is False
@@ -305,13 +208,6 @@ class SerializedAttention(PointModule):
             if self.upcast_softmax:
                 attn = attn.float()
             attn = self.softmax(attn)
-
-            # tag = self.attn_tag or f"oi{self.order_index}"
-            # point[f"attn_m_{tag}"] = attn.mean(dim=1).detach().cpu()
-            # point[f"attn_order_{tag}"] = order.detach().cpu()
-            # point[f"attn_inverse_{tag}"] = inverse.detach().cpu()
-            # point[f"attn_pad_{tag}"] = pad.detach().cpu()
-
             attn = self.attn_drop(attn).to(qkv.dtype)
             feat = (attn @ v).transpose(1, 2).reshape(-1, C)
         else:
@@ -379,7 +275,6 @@ class Block(PointModule):
         enable_flash=True,
         upcast_attention=True,
         upcast_softmax=True,
-        attn_tag=None
     ):
         super().__init__()
         self.channels = channels
@@ -411,7 +306,6 @@ class Block(PointModule):
             enable_flash=enable_flash,
             upcast_attention=upcast_attention,
             upcast_softmax=upcast_softmax,
-            attn_tag=attn_tag,
         )
         self.norm2 = PointSequential(norm_layer(channels))
         self.mlp = PointSequential(
@@ -741,10 +635,6 @@ class PointTransformerV3(PointModule):
                     name="down",
                 )
             for i in range(enc_depths[s]):
-
-                save_this = (s == self.num_stages - 1) and (i == enc_depths[s] - 1)
-                attn_tag = f"enc{s}_block{i}" if save_this else None
-
                 enc.add(
                     Block(
                         channels=enc_channels[s],
@@ -765,7 +655,6 @@ class PointTransformerV3(PointModule):
                         enable_flash=enable_flash,
                         upcast_attention=upcast_attention,
                         upcast_softmax=upcast_softmax,
-                        attn_tag=attn_tag,
                     ),
                     name=f"block{i}",
                 )
@@ -840,13 +729,6 @@ class PointTransformerV3(PointModule):
 
         point = self.embedding(point)
         point = self.enc(point)
-# # 2) 특정 patch, query 선택
-#         coords, w, q_coord, key_ids = extract_patch_attention_by_tag(
-#             point, tag="enc4_block1", patch_idx=10, query_idx=5
-#         )
-#         # 3) 시각화
-#         show_patch_attention_o3d(coords, w, q_coord=q_coord, point_size=5.0)
-
         if not self.cls_mode:
             point = self.dec(point)
         else:
