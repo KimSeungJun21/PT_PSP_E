@@ -5,8 +5,9 @@ import numpy as np
 import wandb  # ✅ wandb 추가
 
 os.environ.pop("BOOST_ROOT", None)
+
 sys.path.insert(0, "/home/kimseungjun/task/PointTransformer/Pointcept")
-sys.path.insert(0, "/home/kimseungjun/task/PointTransformer/My_point_transformer_ver2")
+sys.path.insert(0, "/home/kimseungjun/task/PointTransformer/My_point_transformer")
 
 from model_utils.data_loader import PT_data_loader, unified_collate_fn
 from models.PT3_model import PointTransformerV3
@@ -18,7 +19,7 @@ from torch.utils.data import random_split,DataLoader
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-
+import json
 
 from pointcept.datasets import build_dataset, point_collate_fn, collate_fn
 device = torch.device("cuda:0")
@@ -202,7 +203,14 @@ def train_loop():
 
     PT_model = PointTransformerV3()
     PT_model.to(device)
-    pos_weight = torch.tensor([1.0], device=device)
+    # pose_weights_path = '/home/kimseungjun/datasets/My_PT_data/PT_data/train/label_stats.json'
+    # with open(pose_weights_path,'r') as f:
+    #     pw = json.load(f)
+    # suggested_w = pw['stats']['suggested_pos_weight']
+    # weight_for_0 = 478 / 64  # 약 7.46
+    # weight_for_1 = 1.0
+    
+    # weights = torch.tensor([1.0, suggested_w], device=device)
 
     #loss_model = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
     loss_fn = nn.CrossEntropyLoss()
@@ -253,7 +261,6 @@ def train_loop():
 
         for i, (batch) in enumerate(train_data_loader):
             iter_range = e*len(train_data_loader) + i
-            #label = batch.pop("label").to(device).float()      # (B,) float
             label = batch.pop("label").to(device).long()      # (B,) long
             inputs = batch                                     # {'coord','feat','offset', ...}
 
@@ -261,44 +268,22 @@ def train_loop():
             move_to_device(inputs, device)                  # {'coord','feat','offset',...}
             optimizer.zero_grad(set_to_none=True)
         
-            # print(f"\n=== Batch {i} Debug Info ===")
-            # print(f"1. Keys in batch: {batch.keys()}")
-            # if "grid_coord" in batch:
-            #     gc = batch["grid_coord"]
-            #     print(f"2. Grid Coord - Shape: {gc.shape}, Dtype: {gc.dtype}")
-            #     print(f"3. Grid Coord - Max: {gc.max(0)[0].tolist()}, Min: {gc.min(0)[0].tolist()}")
-                
-            #     # 힐베르트 에러의 핵심: 비트 연산 가능 여부 체크
-            #     # 만약 max값이 너무 크거나 min이 음수면 여기서 에러가 예견됩니다.
-            #     if gc.numel() > 0:
-            #         diff = gc.max(0)[0] - gc.min(0)[0]
-            #         print(f"4. Grid Range (Max-Min): {diff.tolist()}")
-            # else:
-            #     print("!!! WARNING: grid_coord is MISSING in batch !!!")
-            
-            # print(f"5. Offset: {batch['offset']}")
-            # print("============================\n")
-            # --- 원인 검사 끝 ---
 
             inputs = {k: v.cuda() if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
-            alpha, beta, p = PT_model(inputs)
-            
+            logits = PT_model(inputs) # 출력 형태: (B, 2)
+            target = label.view(-1).long() # (B,) 형태의 LongTensor            
 #            target = label.float().unsqueeze(1)
-            target = label.view(-1) 
-            evi_loss = evidential_loss(alpha=alpha, beta=beta, y=target, lam=0.1)
 
+            loss = loss_fn(logits, target)
+            #evi_loss = evidential_loss(alpha=alpha, beta=beta, y=target, lam=0.1)
 
-            # 2) 그래디언트 실제로 생기는지
-            #optimizer.zero_grad()
-            evi_loss.backward()
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
 
-            pred_label = (p > 0.5).long()
-            n_correct = (pred_label == label).sum()
-            # pred_label = (p > 0.5).long()  
-            # n_correct = (pred_label == label.float()).sum()
-
+            preds = torch.argmax(logits, dim=1)
+            n_correct = (preds == target).sum()
             batch_acc = (n_correct.float() / len(target)).item()
-            epoch_train_losses.append(evi_loss.item())
+            epoch_train_losses.append(loss.item())
             epoch_train_accs.append(batch_acc)
 
             #loss.backward()
@@ -313,15 +298,15 @@ def train_loop():
                 result_s = "***"*20 + " " + times + "\n"
                 print(result_s)
                 print(f'Train Epoch: {e} / iter.{iter_range}')
-                print('epoch loss',evi_loss.item())
+                print('epoch loss',loss.item())
                 print('epoch accuracy',accuracy.item())
-                correct_mask = (pred_label == label)
+                correct_mask = (preds == label)
                 wrong_mask   = ~correct_mask
 
-                S = alpha + beta
+                # S = alpha + beta
 
-                print("correct S mean:", S[correct_mask].mean().item())
-                print("wrong   S mean:", S[wrong_mask].mean().item())
+                # print("correct S mean:", S[correct_mask].mean().item())
+                # print("wrong   S mean:", S[wrong_mask].mean().item())
                             
             count+=1
             global_step = 0
@@ -351,20 +336,20 @@ def train_loop():
                 move_to_device(inputs, device)                  # {'coord','feat','offset',...}
                 optimizer.zero_grad(set_to_none=True)
 
-                alpha, beta, p = PT_model(inputs)
-                target = label.float().unsqueeze(1)
-                evi_loss = evidential_loss(alpha=alpha, beta=beta, y=target, lam=0.1)
-                #loss = loss_model(out, target)
+                logits = PT_model(inputs) # 출력 형태: (B, 2)
+                target = label.view(-1).long() # (B,) 형태의 LongTensor  
+                #evi_loss = evidential_loss(alpha=alpha, beta=beta, y=target, lam=0.1)
+                loss = loss_fn(logits, target)
                 
-                #pred_label = (probs > 0.5).long()
-                pred_label = (p > 0.5).long()
+                pred_label = torch.argmax(logits, dim=1)
+
                 corr  = (pred_label == label.float()).sum().item()
                 B = target.numel()     
                 val_pred_pos  += pred_label.sum().item()
                 val_label_pos += label.long().sum().item()
                 val_correct += corr
                 val_total   += B
-                val_loss_sum += evi_loss.item() * B
+                val_loss_sum += loss.item() * B
             
             val_loss_epoch = val_loss_sum / val_total
             val_acc_epoch  = val_correct / val_total

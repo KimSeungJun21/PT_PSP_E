@@ -22,48 +22,6 @@ import logging, os
 log = get_root_logger(file_mode="a")  # "w"면 매번 새로
 
 
-
-# transform=[
-#             dict(type="CenterShift", apply_z=True),
-#             dict(
-#                 type="RandomDropout", dropout_ratio=0.2, dropout_application_ratio=0.2
-#             ),
-#             # dict(type="RandomRotateTargetAngle", angle=(1/2, 1, 3/2), center=[0, 0, 0], axis="z", p=0.75),
-#             dict(type="RandomRotate", angle=[-1, 1], axis="z", center=[0, 0, 0], p=0.5),
-#             dict(type="RandomRotate", angle=[-1 / 64, 1 / 64], axis="x", p=0.5),
-#             dict(type="RandomRotate", angle=[-1 / 64, 1 / 64], axis="y", p=0.5),
-#             dict(type="RandomScale", scale=[0.9, 1.1]),
-#             # dict(type="RandomShift", shift=[0.2, 0.2, 0.2]),
-#             dict(type="RandomFlip", p=0.5),
-#             dict(type="RandomJitter", sigma=0.005, clip=0.02),
-#             # dict(type="ElasticDistortion", distortion_params=[[0.2, 0.4], [0.8, 1.6]]),
-#             dict(type="ChromaticAutoContrast", p=0.2, blend_factor=None),
-#             dict(type="ChromaticTranslation", p=0.95, ratio=0.05),
-#             dict(type="ChromaticJitter", p=0.95, std=0.05),
-#             # dict(type="HueSaturationTranslation", hue_max=0.2, saturation_max=0.2),
-#             # dict(type="RandomColorDrop", p=0.2, color_augment=0.0),
-#             dict(
-#                 type="GridSample",
-#                 grid_size=0.02,
-#                 hash_type="fnv",
-#                 mode="train",
-#                 return_grid_coord=True,
-#                 keys = ('coord',)
-#             ),
-#             dict(type="SphereCrop", sample_rate=0.6, mode="random"),
-#             dict(type="SphereCrop", point_max=204800, mode="random"),
-#             dict(type="CenterShift", apply_z=False),
-#             dict(type="NormalizeColor"),
-#             # dict(type="ShufflePoint"),
-#             dict(type="ToTensor"),
-#             dict(
-#                 type="Collect",
-#                 keys=("coord", "grid_coord", "segment"),
-#                 feat_keys=("coord", ),
-#             ),
-#         ]
-
-
 def safe_torch_load(fn, map_location="cpu"):
     """
     Load a torch serialized file with a clearer error message for corrupted files.
@@ -120,7 +78,7 @@ def build_transform(include_color: bool = False):
         dict(
             type="Collect",
             keys=("coord", "grid_coord", "segment"),
-            feat_keys=("normal", "instance") + (("color",) if include_color else ()),
+            feat_keys=("normal",) + (("color",) if include_color else ()),
         ),
     ]
     return t
@@ -256,44 +214,56 @@ def safe_torch_load(fn, map_location="cpu"):
 #     out["label"] = torch.tensor(labels, dtype=torch.long)
 
 #     return out
-def unified_collate_fn(batch, mix_prob=0.0, **kwargs):
-    dicts, labels = zip(*batch)
-    coords_list, feats_list, lens = [], [], []
+def unified_collate_fn(batch):
+    # batch: [( {"scene": d_s, "target": d_t}, label ), ... ] 형태
+    items, labels = zip(*batch)
     
-    for d in dicts:
-        coords_list.append(torch.as_tensor(d["coord"]).float())
-        feats_list.append(torch.as_tensor(d["feat"]).float())
-        lens.append(d["coord"].shape[0])
+    # scene과 target 데이터를 분리
+    scene_dicts = [it["scene"] for it in items]
+    target_dicts = [it["target"] for it in items]
 
-    # 기본값 설정
-    grid_size = dicts[0].get("grid_size", 0.05)
-    offset = torch.cumsum(torch.tensor(lens, dtype=torch.long), dim=0)
+    def collate_ptv3(dicts):
+        """PTv3 포맷에 맞게 딕셔너리 리스트를 하나로 합치는 헬퍼 함수"""
+        coords_list, feats_list, grid_coords_list, lens = [], [], [], []
+        
+        for d in dicts:
+            coords_list.append(torch.as_tensor(d["coord"]).float())
+            feats_list.append(torch.as_tensor(d["feat"]).float())
+            lens.append(d["coord"].shape[0])
+            if "grid_coord" in d:
+                grid_coords_list.append(torch.as_tensor(d["grid_coord"]))
 
-    out = {
-        "coord": torch.cat(coords_list, dim=0),
-        "feat": torch.cat(feats_list, dim=0),
-        "offset": offset,
-        "grid_size": grid_size,
+        offset = torch.cumsum(torch.tensor(lens, dtype=torch.long), dim=0)
+        
+        out = {
+            "coord": torch.cat(coords_list, dim=0),
+            "feat": torch.cat(feats_list, dim=0),
+            "offset": offset,
+        }
+
+        if grid_coords_list:
+            grid_coords = torch.cat(grid_coords_list, dim=0)
+            grid_coords -= grid_coords.min(dim=0)[0] # 음수 방지
+            out["grid_coord"] = grid_coords.to(torch.int32)
+            
+            # batch index 생성
+            batch_ids = []
+            for i, l in enumerate(lens):
+                batch_ids.append(torch.full((l,), i, dtype=torch.int64))
+            out["batch"] = torch.cat(batch_ids, dim=0)
+        
+        return out
+
+    # Scene과 Target 각각에 대해 합치기 수행
+    scene_batch = collate_ptv3(scene_dicts)
+    target_batch = collate_ptv3(target_dicts)
+
+    # 최종 결과 구성
+    return {
+        "scene": scene_batch,
+        "target": target_batch,
         "label": torch.tensor(labels, dtype=torch.long)
     }
-    
-    # ⭐ grid_coord 처리: 타입과 범위를 엄격하게 제한
-    if "grid_coord" in dicts[0]:
-        grid_coords = torch.cat([torch.as_tensor(d["grid_coord"]) for d in dicts], dim=0)
-        
-        # 1. 최소값을 0으로 맞춰 음수 방지
-        grid_coords -= grid_coords.min(dim=0)[0]
-        
-        # 2. 타입 변환 (Long보다 Int32가 힐베르트 연산에 더 안정적일 수 있음)
-        out["grid_coord"] = grid_coords.to(torch.int32)
-        
-        # 3. 추가 안전장치: batch 정보 명시
-        batch_ids = []
-        for i, l in enumerate(lens):
-            batch_ids.append(torch.full((l,), i, dtype=torch.int64))
-        out["batch"] = torch.cat(batch_ids, dim=0)
-
-    return out
 
 # def unified_collate_fn(batch, mix_prob=0.0, **kwargs):
 #     dicts, labels = zip(*batch)
@@ -410,8 +380,20 @@ class PT_data_loader(Dataset):
                     data_dict["color"] = datas["color"][mask]
 
                 # 3. Transform 적용 (GridSample, SphereCrop 등)
-                data_dict = self.transform(data_dict)
+                target_indices = np.where(data_dict["instance"].flatten() == 1)[0]
+                if len(target_indices) < 10: # 타겟 포인트가 너무 적으면 에러 처리
+                    raise ValueError(f"Target object has too few points: {len(target_indices)}")
+                target_dict = dict(
+                    coord=data_dict["coord"][target_indices].copy(),
+                    normal=data_dict["normal"][target_indices].copy(),
+                    segment=data_dict["segment"][target_indices].copy(),
+                    instance=data_dict["instance"][target_indices].copy(), # ⭐ 이 줄을 추가하세요!
+                )                
+                if "color" in data_dict:
+                    target_dict["color"] = data_dict["color"][target_indices].copy()
 
+                data_dict = self.transform(data_dict)
+                target_dict = self.transform(target_dict)
                 # 4. ⭐ 핵심 체크: 포인트 개수가 너무 적으면 학습 불가 (PTv3 최소 기준)
                 # 힐베르트 인코딩 에러를 피하기 위해 최소 32개 이상의 포인트 권장
                 if data_dict["coord"].shape[0] < 32:
@@ -421,7 +403,7 @@ class PT_data_loader(Dataset):
                 data_dict['data_fn'] = fn
                 raw_label = datas['label']
                 label = int(raw_label) if isinstance(raw_label, (bool, np.bool_)) else int(raw_label)
-                return data_dict, label
+                return {"scene": data_dict, "target": target_dict}, label
 
             except Exception as e:
                 # 에러 발생 시 로그를 남기고 다른 인덱스로 재시도
@@ -454,12 +436,13 @@ if __name__ == '__main__':
     )
 
     for batch in tqdm(train_loader):
-        # 이제 unified_collate_fn에 의해 batch는 dict가 됩니다.
-        point_feat = batch['feat']    # 입력 특징 (N, C)
-        coords = batch['coord']       # 좌표 (N, 3)
-        offset = batch['offset']      # 배치 구분용 오프셋
-        label = batch['label']        # 정답 (B,)
+            # 구조가 바뀌었으므로 접근 방식도 변경
+            scene_feat = batch['scene']['feat']    
+            target_feat = batch['target']['feat']  
+            scene_offset = batch['scene']['offset']
+            label = batch['label']
 
-        print(f"\n[Check] Feat shape: {point_feat.shape}") # (N, 4) 혹은 (N, 7)
-        print(f"[Check] Label: {label}")
+            print(f"\n[Check] Scene Feat: {scene_feat.shape}") 
+            print(f"[Check] Target Feat: {target_feat.shape}")
+            print(f"[Check] Scene Offset: {scene_offset}")
         #break # 하나만 확인하고 중단

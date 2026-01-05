@@ -5,6 +5,7 @@ import numpy as np
 import wandb  # ✅ wandb 추가
 
 os.environ.pop("BOOST_ROOT", None)
+
 sys.path.insert(0, "/home/kimseungjun/task/PointTransformer/Pointcept")
 sys.path.insert(0, "/home/kimseungjun/task/PointTransformer/My_point_transformer")
 
@@ -18,7 +19,7 @@ from torch.utils.data import random_split,DataLoader
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-
+import json
 
 from pointcept.datasets import build_dataset, point_collate_fn, collate_fn
 device = torch.device("cuda:0")
@@ -74,9 +75,14 @@ def time_stamp():
 
 
 # ====== 학습/평가 ======
+# def accuracy_from_logits(logits, y):
+#     probs = torch.sigmoid(logits)
+#     preds = (probs > 0.5).long()
+#     return (preds == y).float().mean().item()
+
 def accuracy_from_logits(logits, y):
-    probs = torch.sigmoid(logits)
-    preds = (probs > 0.5).long()
+    # logits: (B, 2), y: (B,)
+    preds = torch.argmax(logits, dim=1)
     return (preds == y).float().mean().item()
 
 def accuracy_from_prob(p, y):
@@ -165,7 +171,7 @@ def evidential_loss(alpha, beta, y, lam=0.2,eps=1e-8):
 
 def train_loop():
     data_path = '/home/kimseungjun/datasets/My_PT_data/PT_data'
-    batch_size = 4
+    batch_size = 1
     max_iter = 64000
     lr = 0.001
     max_epoch = 300
@@ -178,8 +184,8 @@ def train_loop():
             train_data,
             batch_size=batch_size,
             shuffle=True,
-            num_workers=8,
-            collate_fn=partial(unified_collate_fn, mix_prob=0.0),
+            num_workers=1,
+            collate_fn=unified_collate_fn,
             pin_memory=True,
             drop_last=True,
             persistent_workers=True,
@@ -188,8 +194,8 @@ def train_loop():
             valid_data,
             batch_size=batch_size,
             shuffle=False,
-            num_workers=8,
-            collate_fn=partial(unified_collate_fn, mix_prob=0.0),
+            num_workers=1,
+            collate_fn=unified_collate_fn,
             pin_memory=True,
             drop_last=True,
             persistent_workers=True,
@@ -197,9 +203,17 @@ def train_loop():
 
     PT_model = PointTransformerV3()
     PT_model.to(device)
-    pos_weight = torch.tensor([1.0], device=device)
+    # pose_weights_path = '/home/kimseungjun/datasets/My_PT_data/PT_data/train/label_stats.json'
+    # with open(pose_weights_path,'r') as f:
+    #     pw = json.load(f)
+    # suggested_w = pw['stats']['suggested_pos_weight']
+    # weight_for_0 = 478 / 64  # 약 7.46
+    # weight_for_1 = 1.0
+    
+    # weights = torch.tensor([1.0, suggested_w], device=device)
 
-    loss_model = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    #loss_model = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    loss_fn = nn.CrossEntropyLoss()
     set_seed(CFG.seed)
     os.makedirs(CFG.save_dir, exist_ok=True)
     # ✅ wandb 초기화
@@ -233,11 +247,14 @@ def train_loop():
     #     )
     optimizer = optim.AdamW(PT_model.parameters(), lr=CFG.lr, weight_decay=CFG.wd)
 
-    #scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=3, gamma=0.7)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=CFG.t_max, eta_min=CFG.min_lr)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.7)
+    #scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=CFG.t_max, eta_min=CFG.min_lr)
 
     count =0
     global_step = 0
+    optimizer.zero_grad(set_to_none=True)
+    accumulation_steps = 16  # 논리적 배치 사이즈를 16으로 설정
+    
     for e in range(max_epoch):
         PT_model.train()
         total_correct_n = 0
@@ -247,36 +264,34 @@ def train_loop():
 
         for i, (batch) in enumerate(train_data_loader):
             iter_range = e*len(train_data_loader) + i
-            #label = batch.pop("label").to(device).float()      # (B,) float
             label = batch.pop("label").to(device).long()      # (B,) long
             inputs = batch                                     # {'coord','feat','offset', ...}
 
             # 입력 텐서 전부 같은 디바이스로    
             move_to_device(inputs, device)                  # {'coord','feat','offset',...}
-            optimizer.zero_grad(set_to_none=True)
         
-            alpha, beta, p = PT_model(inputs)
-            
+            logits = PT_model(inputs) # 출력 형태: (B, 2)
+            target = label.view(-1).long() # (B,) 형태의 LongTensor            
 #            target = label.float().unsqueeze(1)
-            target = label.view(-1) 
-            evi_loss = evidential_loss(alpha=alpha, beta=beta, y=target, lam=0.1)
 
+            loss = loss_fn(logits, target)
+            #evi_loss = evidential_loss(alpha=alpha, beta=beta, y=target, lam=0.1)
+            loss = loss / accumulation_steps
+            loss.backward()
 
-            # 2) 그래디언트 실제로 생기는지
-            #optimizer.zero_grad()
-            evi_loss.backward()
-
-            pred_label = (p > 0.5).long()
-            n_correct = (pred_label == label).sum()
-            # pred_label = (p > 0.5).long()  
-            # n_correct = (pred_label == label.float()).sum()
-
+            preds = torch.argmax(logits, dim=1)
+            n_correct = (preds == target).sum()
             batch_acc = (n_correct.float() / len(target)).item()
-            epoch_train_losses.append(evi_loss.item())
+            epoch_train_losses.append(loss.item())
             epoch_train_accs.append(batch_acc)
 
             #loss.backward()
-            optimizer.step()
+
+            if (i + 1) % accumulation_steps == 0:
+                    optimizer.step()
+                    optimizer.zero_grad(set_to_none=True)
+
+            #optimizer.step()
             stt = (e+1) * len(train_data_loader)
             
             total_correct_n +=n_correct
@@ -287,15 +302,15 @@ def train_loop():
                 result_s = "***"*20 + " " + times + "\n"
                 print(result_s)
                 print(f'Train Epoch: {e} / iter.{iter_range}')
-                print('epoch loss',evi_loss.item())
+                print('epoch loss',loss.item())
                 print('epoch accuracy',accuracy.item())
-                correct_mask = (pred_label == label)
+                correct_mask = (preds == label)
                 wrong_mask   = ~correct_mask
 
-                S = alpha + beta
+                # S = alpha + beta
 
-                print("correct S mean:", S[correct_mask].mean().item())
-                print("wrong   S mean:", S[wrong_mask].mean().item())
+                # print("correct S mean:", S[correct_mask].mean().item())
+                # print("wrong   S mean:", S[wrong_mask].mean().item())
                             
             count+=1
             global_step = 0
@@ -323,22 +338,21 @@ def train_loop():
 
                 # 입력 텐서 전부 같은 디바이스로    
                 move_to_device(inputs, device)                  # {'coord','feat','offset',...}
-                optimizer.zero_grad(set_to_none=True)
 
-                alpha, beta, p = PT_model(inputs)
-                target = label.float().unsqueeze(1)
-                evi_loss = evidential_loss(alpha=alpha, beta=beta, y=target, lam=0.1)
-                #loss = loss_model(out, target)
+                logits = PT_model(inputs) # 출력 형태: (B, 2)
+                target = label.view(-1).long() # (B,) 형태의 LongTensor  
+                #evi_loss = evidential_loss(alpha=alpha, beta=beta, y=target, lam=0.1)
+                loss = loss_fn(logits, target)
                 
-                #pred_label = (probs > 0.5).long()
-                pred_label = (p > 0.5).long()
+                pred_label = torch.argmax(logits, dim=1)
+
                 corr  = (pred_label == label.float()).sum().item()
                 B = target.numel()     
                 val_pred_pos  += pred_label.sum().item()
                 val_label_pos += label.long().sum().item()
                 val_correct += corr
                 val_total   += B
-                val_loss_sum += evi_loss.item() * B
+                val_loss_sum += loss.item() * B
             
             val_loss_epoch = val_loss_sum / val_total
             val_acc_epoch  = val_correct / val_total

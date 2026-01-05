@@ -6,7 +6,7 @@ import wandb  # ✅ wandb 추가
 
 os.environ.pop("BOOST_ROOT", None)
 sys.path.insert(0, "/home/kimseungjun/task/PointTransformer/Pointcept")
-sys.path.insert(0, "/home/kimseungjun/task/PointTransformer/My_point_transformer_ver2")
+sys.path.insert(0, "/home/kimseungjun/task/PointTransformer/My_point_transformer")
 
 from model_utils.data_loader import PT_data_loader, unified_collate_fn
 from models.PT3_model import PointTransformerV3
@@ -74,14 +74,9 @@ def time_stamp():
 
 
 # ====== 학습/평가 ======
-# def accuracy_from_logits(logits, y):
-#     probs = torch.sigmoid(logits)
-#     preds = (probs > 0.5).long()
-#     return (preds == y).float().mean().item()
-
 def accuracy_from_logits(logits, y):
-    # logits: (B, 2), y: (B,)
-    preds = torch.argmax(logits, dim=1)
+    probs = torch.sigmoid(logits)
+    preds = (probs > 0.5).long()
     return (preds == y).float().mean().item()
 
 def accuracy_from_prob(p, y):
@@ -170,7 +165,7 @@ def evidential_loss(alpha, beta, y, lam=0.2,eps=1e-8):
 
 def train_loop():
     data_path = '/home/kimseungjun/datasets/My_PT_data/PT_data'
-    batch_size = 1
+    batch_size = 64
     max_iter = 64000
     lr = 0.001
     max_epoch = 300
@@ -183,8 +178,8 @@ def train_loop():
             train_data,
             batch_size=batch_size,
             shuffle=True,
-            num_workers=1,
-            collate_fn=unified_collate_fn,
+            num_workers=8,
+            collate_fn=partial(unified_collate_fn, mix_prob=0.0),
             pin_memory=True,
             drop_last=True,
             persistent_workers=True,
@@ -193,8 +188,8 @@ def train_loop():
             valid_data,
             batch_size=batch_size,
             shuffle=False,
-            num_workers=1,
-            collate_fn=unified_collate_fn,
+            num_workers=8,
+            collate_fn=partial(unified_collate_fn, mix_prob=0.0),
             pin_memory=True,
             drop_last=True,
             persistent_workers=True,
@@ -204,8 +199,7 @@ def train_loop():
     PT_model.to(device)
     pos_weight = torch.tensor([1.0], device=device)
 
-    #loss_model = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-    loss_fn = nn.CrossEntropyLoss()
+    loss_model = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
     set_seed(CFG.seed)
     os.makedirs(CFG.save_dir, exist_ok=True)
     # ✅ wandb 초기화
@@ -261,26 +255,6 @@ def train_loop():
             move_to_device(inputs, device)                  # {'coord','feat','offset',...}
             optimizer.zero_grad(set_to_none=True)
         
-            # print(f"\n=== Batch {i} Debug Info ===")
-            # print(f"1. Keys in batch: {batch.keys()}")
-            # if "grid_coord" in batch:
-            #     gc = batch["grid_coord"]
-            #     print(f"2. Grid Coord - Shape: {gc.shape}, Dtype: {gc.dtype}")
-            #     print(f"3. Grid Coord - Max: {gc.max(0)[0].tolist()}, Min: {gc.min(0)[0].tolist()}")
-                
-            #     # 힐베르트 에러의 핵심: 비트 연산 가능 여부 체크
-            #     # 만약 max값이 너무 크거나 min이 음수면 여기서 에러가 예견됩니다.
-            #     if gc.numel() > 0:
-            #         diff = gc.max(0)[0] - gc.min(0)[0]
-            #         print(f"4. Grid Range (Max-Min): {diff.tolist()}")
-            # else:
-            #     print("!!! WARNING: grid_coord is MISSING in batch !!!")
-            
-            # print(f"5. Offset: {batch['offset']}")
-            # print("============================\n")
-            # --- 원인 검사 끝 ---
-
-            inputs = {k: v.cuda() if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
             alpha, beta, p = PT_model(inputs)
             
 #            target = label.float().unsqueeze(1)

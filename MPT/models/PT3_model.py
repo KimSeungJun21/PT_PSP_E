@@ -857,5 +857,9 @@ class PointTransformerV3(PointModule):
             )
             logits = self.cls_head(feat)
 
+        e = F.softplus(logits) + 1e-6
+        alpha = e[:, 0] + 1.0
+        beta  = e[:, 1] + 1.0
+        p = alpha / (alpha + beta)        # posterior mean
 
-        return logits
+        return alpha,beta,p
